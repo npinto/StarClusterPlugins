@@ -1,0 +1,4 @@
+StarClusterPlugins
+==================
+
+Plugins for StarCluster
