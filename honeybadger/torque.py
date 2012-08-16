@@ -5,8 +5,8 @@ TODO:
 * on add node method
 """
 
-from starcluster.clustersetup import ClusterSetup
-#from starcluster.logger import log
+from starcluster import clustersetup
+from starcluster.logger import log
 
 node_configure_mom = """
 cat > /var/spool/torque/mom_priv/config << EOF
@@ -17,12 +17,11 @@ cat > /var/spool/torque/mom_priv/config << EOF
 EOF
 """
 
-node_start_services = """
-/etc/init.d/pbs_mom start
-"""
-
 master_configure_server = """
-echo 'y' > pbs_server -t create
+mkdir -p /var/spool/torque
+echo 'master' > /var/spool/torque/server_name
+
+pbs_server -t create
 
 qmgr << EOF
 set server scheduling = True
@@ -87,42 +86,86 @@ half_life: 24:00:00
 unknown_shares: 10
 sync_time: 1:00:00
 EOF
-"""
 
-master_start_services = """
-/etc/init.d/pbs_server start
-/etc/init.d/pbs_sched start
 """
 
 
-class TorqueSetup(ClusterSetup):
+
+class TorqueSetup(clustersetup.DefaultClusterSetup):
 
     def run(self, nodes, master, user, user_shell, volumes):
 
+        #master.ssh.execute(
+            #"killall -9 pbs_server; killall -9 pbs_sched; CLEAN_DELAY=0 emerge -C torque; rm -rvf /var/spool/torque; FEATURES=buildpkg emerge -g -j torque",
+            #silent=False)
+        #import IPython; ipshell = IPython.embed; ipshell(banner1='ipshell')
+
         # -- configure torque's server and scheduler on the master node
+        log.info("Configuring torque server...")
         master.ssh.execute(master_configure_server)
 
         # -- configure torque's clients on each node and complete the
         # configuration on the master node
-        for node in nodes:
-            if node is master:
-                continue
+        for node in nodes[1:]:
+            log.info("Configuring torque node '%s'..." % node.alias)
             node.ssh.execute(node_configure_mom)
-            node_spec = node.alias + ' '
-            np = int(node.ssh.execute(
-                "grep '^processor.*: [0-9]*$' /proc/cpuinfo | wc -l")[0])
-            node_spec += "np=%d " % np
-            gpus = int(node.ssh.execute("ls /dev/nvidia[0-9]* | wc -w")[0])
-            if gpus > 0:
-                node_spec += "gpus=%d " % gpus
-            node_spec += "batch.q"  # default queue
-            print node_spec
-            master.ssh.execute(
-                "echo %s >> /var/spool/torque/server_priv/nodes" % node_spec,
-                )
+            self._add_torque_node_to_master(node, master)
 
-        # -- start services
-        for node in nodes:
-            if node is master:
-                master.ssh.execute(master_start_services)
-            node.ssh.execute(node_start_services)
+        # -- (re)start services
+        log.info("Starting torque services...")
+        self._force_deamon_restart(master, 'pbs_server')
+        for node in nodes[1:]:
+            self._start_torque_node_daemon(node)
+        self._force_deamon_restart(master, 'pbs_sched')
+
+        # -- print infos / debug
+        log.debug("Torque server information:")
+        master.ssh.execute("qmgr -c 'l s'")
+        master.ssh.execute("qmgr -c 'p s'")
+
+        log.debug("Torque nodes information:")
+        for node in nodes[1:]:
+            master.ssh.execute('momctl -h %s -d 2' % node.alias)
+        master.ssh.execute("qnodes")
+
+    def on_add_node(self, node, nodes, master, user, user_shell, volumes):
+        print 'on_add_node'
+        #import IPython; ipshell = IPython.embed; ipshell(banner1='ipshell')
+
+    def on_remove_node(self, node, nodes, master, user, user_shell, volumes):
+        pass
+
+    def _add_torque_node_to_master(self, node, master):
+
+        node_spec = node.alias + ' '
+
+        np = int(node.ssh.execute(
+            "grep '^processor.*: [0-9]*$' /proc/cpuinfo | wc -l")[0])
+        node_spec += "np=%d " % np
+
+        gpus = int(node.ssh.execute("ls /dev/nvidia[0-9]* | wc -w")[0])
+        if gpus > 0:
+            node_spec += "gpus=%d " % gpus
+
+        node_spec += "batch.q"  # our default queue
+
+        log.debug("Using node_spec = '%s'", node_spec)
+        master.ssh.execute(
+            "echo %s >> /var/spool/torque/server_priv/nodes" % node_spec,
+            )
+
+    def _start_torque_node_daemon(self, node):
+        self._force_deamon_restart(node, 'pbs_mom')
+
+    def _remove_torque_node_from_master(self, node, master):
+        cmd = ("sed -i -e 's/^%s .*batch.q$//g' "
+               "/var/spool/torque/server_priv/nodes" % node.alias)
+        master.ssh.execute(cmd)
+
+    def _force_deamon_restart(self, machine, service):
+        # -- dirty work around the poorly written init.d script
+        # XXX: fix init.d stuff in torque's ebuild
+        machine.ssh.execute("/etc/init.d/%s stop &> /dev/null | true" % service)
+        machine.ssh.execute("killall -9 %s &> /dev/null | true" % service)
+        machine.ssh.execute("sleep 2")
+        machine.ssh.execute("/etc/init.d/%s start" % service)
